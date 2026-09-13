@@ -1,9 +1,8 @@
 # VoxCoach — Full Build Spec (PRD + Roadmap + TRD)
-**Pak-Angels Cohort 11 · Mid-Course Hackathon · 6-hour build**
+**Pak-Angels Cohort 11 · Mid-Course Hackathon · 50-hour build**
 **One product: a Gradio voice bot you talk to for real-time speaking practice.**
 
-*(Current architecture: a single Gradio app on Hugging Face Spaces. This supersedes all earlier
-FastAPI + Netlify + Docker drafts.)*
+*(Current architecture: a single Gradio app on Hugging Face Spaces.)*
 
 ---
 
