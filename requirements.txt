@@ -1,0 +1,17 @@
+# VoxCoach — Streamlit Community Cloud
+#
+# Changes from the HuggingFace Space's requirements:
+#   - gradio   removed (replaced by streamlit)
+#   - spaces   removed (it existed only for the ZeroGPU startup check on HF)
+#
+# streamlit: st.audio_input shipped in 1.39.0, so >=1.40 is the real floor.
+# Left unpinned above that so Community Cloud can take security updates;
+# pin exactly if a future release ever breaks the mic widget.
+streamlit>=1.40
+
+groq
+gTTS
+pypdf
+docx2txt
+python-pptx
+rank-bm25
