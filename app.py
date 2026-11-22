@@ -235,35 +235,125 @@ def _audio_fingerprint(data):
 
 
 # ---------------------------------------------------------------- context + lightweight RAG
+def _pptx_text(raw):
+    """Pull text out of a .pptx.
+
+    The first version of this was `sh.text for sh in slide.shapes if
+    sh.has_text_frame`, which looked reasonable and lost most real decks:
+
+      * GROUPED SHAPES were skipped entirely. slide.shapes does not recurse,
+        and a group is not itself a text frame — so a deck built the way
+        designers actually build them (everything grouped) extracted to
+        nothing at all, and the app reported "could not read that file".
+      * TABLES were skipped. A table is not a text frame; its text lives in
+        table.rows[].cells[].
+      * SPEAKER NOTES were skipped, and in a talk deck the notes are often
+        where the actual sentences are.
+
+    Each shape is also read inside its own try/except, so one unreadable
+    object cannot cost the whole file — losing one chart title is a fine
+    trade for keeping the other ninety slides."""
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    out = []
+
+    def walk(shapes, depth=0):
+        if depth > 10:          # groups can nest; this bounds the recursion
+            return
+        for sh in shapes:
+            try:
+                if sh.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    walk(sh.shapes, depth + 1)
+                    continue
+            except Exception:
+                pass
+            try:
+                if getattr(sh, "has_text_frame", False):
+                    t = sh.text_frame.text
+                    if t and t.strip():
+                        out.append(t.strip())
+                if getattr(sh, "has_table", False):
+                    for row in sh.table.rows:
+                        cells = [(c.text or "").strip() for c in row.cells]
+                        if any(cells):
+                            out.append(" | ".join(cells))
+                if getattr(sh, "has_chart", False) and sh.chart.has_title:
+                    out.append(sh.chart.chart_title.text_frame.text.strip())
+            except Exception:
+                continue
+
+    prs = Presentation(io.BytesIO(raw))
+    for slide in prs.slides:
+        walk(slide.shapes)
+        try:
+            if slide.has_notes_slide:
+                n = slide.notes_slide.notes_text_frame.text
+                if n and n.strip():
+                    out.append(n.strip())
+        except Exception:
+            pass
+    return "\n".join(out)
+
+
+def _pdf_text(raw):
+    """Per-page extraction. One malformed page in a long PDF should cost that
+    page, not the document."""
+    from pypdf import PdfReader
+    pages = []
+    for pg in PdfReader(io.BytesIO(raw)).pages:
+        try:
+            pages.append(pg.extract_text() or "")
+        except Exception:
+            continue
+    return "\n".join(pages)
+
+
 def extract_text(uploaded):
     """Read an uploaded CV / JD / notes / slide deck.
 
-    Unlike the Worker ports, this stays in Python: Streamlit runs a real
-    process with a real filesystem, so pypdf / docx2txt / python-pptx work as
-    they did on the Space. Each library accepts a file-like object, so the
-    upload never has to be written to disk."""
+    Returns (text, error). `error` is a short human-readable reason the file
+    could not be opened at all, or None.
+
+    The two outcomes are deliberately distinct. "I could not open this" and
+    "I opened it and there is no text in it" need different messages — a
+    scanned PDF or an all-images deck is not a broken file, and telling
+    someone it is sends them off re-exporting a file that was fine.
+
+    This stays in Python rather than moving to the browser like the Worker
+    ports: Streamlit runs a real process, so pypdf / docx2txt / python-pptx
+    work as they did on the Space. Each accepts a file-like object, so the
+    upload is never written to disk."""
     if uploaded is None:
-        return ""
+        return "", None
+
     name = (getattr(uploaded, "name", "") or "").lower()
     try:
         raw = uploaded.getvalue()
     except Exception:
-        raw = uploaded.read()
+        try:
+            raw = uploaded.read()
+        except Exception as e:
+            return "", f"could not read the upload ({e})"
+
+    if not raw:
+        return "", "the file is empty"
+
     try:
         if name.endswith(".pdf"):
-            from pypdf import PdfReader
-            return "\n".join((pg.extract_text() or "") for pg in PdfReader(io.BytesIO(raw)).pages)
+            return _pdf_text(raw), None
         if name.endswith(".docx"):
             import docx2txt
-            return docx2txt.process(io.BytesIO(raw)) or ""
+            return (docx2txt.process(io.BytesIO(raw)) or ""), None
         if name.endswith(".pptx"):
-            from pptx import Presentation
-            return "\n".join(sh.text for s in Presentation(io.BytesIO(raw)).slides
-                             for sh in s.shapes if sh.has_text_frame)
-        return raw.decode("utf-8", errors="ignore")
+            return _pptx_text(raw), None
+        return raw.decode("utf-8", errors="ignore"), None
     except Exception as e:
-        print("extract error:", e)
-        return ""
+        # Surfaced to the user, not just printed. The first version swallowed
+        # this and showed a flat "Could not read that file", which made a
+        # real failure impossible to diagnose from the app.
+        print("extract error:", type(e).__name__, e)
+        return "", f"{type(e).__name__}: {e}"
 
 
 def _chunk(text, size=800):
@@ -394,12 +484,21 @@ if ctx_mode == "Paste text":
 else:
     up = st.sidebar.file_uploader("Upload document", type=["pdf", "docx", "pptx", "txt"])
     if up is not None:
-        text = extract_text(up)
-        if text.strip():
+        text, err = extract_text(up)
+        if err:
+            st.sidebar.error(f"Could not read that file — {err}")
+        elif text.strip():
             st.session_state.doctxt = text
             st.sidebar.success(f"Loaded document ({len(text):,} characters).")
         else:
-            st.sidebar.warning("Could not read that file.")
+            # Opened fine, genuinely contains no extractable text. Saying
+            # "could not read" here would send someone off re-exporting a
+            # file that was never the problem.
+            st.sidebar.warning(
+                "Opened that file, but found no text in it. If it is a scan or a "
+                "deck of image slides there is nothing to extract — paste the key "
+                "points instead."
+            )
 
 CFG = {"mode": mode, "persona": persona, "target": target, "native": native,
        "vocab": vocab, "ctx_mode": ctx_mode, "ctx_paste": ctx_paste}

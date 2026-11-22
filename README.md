@@ -83,6 +83,17 @@ guard, one spoken sentence is transcribed and answered on every rerun — a real
 call and a real chat call each time. A SHA-256 fingerprint of the audio bytes makes a
 recording process exactly once.
 
+**Document extraction was rewritten after a real deck failed.** The Space read
+`.pptx` as `shape.text for shape in slide.shapes if shape.has_text_frame`, which
+quietly loses most real decks: `slide.shapes` does not recurse into **groups**, and a
+group is not a text frame — so a deck built the way designers build them extracted to
+nothing. **Tables** and **speaker notes** were dropped for the same reason. All three
+are read now, each shape inside its own `try`, so one unreadable object cannot cost the
+whole file. `extract_text` also returns `(text, error)` so the app can tell *"could not
+open this"* from *"opened it, there is no text in it"* — a scanned PDF or an
+all-images deck is not a broken file, and saying so sends people off re-exporting
+something that was fine.
+
 **The section radio has no `key=`.** With one, Streamlit refuses any later assignment to
 that state key in the same run (`StreamlitWidgetAlreadyInstantiatedError`), and
 "End & Save conversation" does exactly that when it jumps to Feedback — so the app would
