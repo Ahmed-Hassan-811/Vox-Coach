@@ -41,11 +41,14 @@ WHAT CHANGED IN THE PORT — read this before editing
    last_audio_id check make a recording process exactly once.
 """
 
+import hashlib
+import html
 import io
 import json
 import os
+import re
 import time
-import hashlib
+import zipfile
 
 import streamlit as st
 from groq import Groq
@@ -293,7 +296,63 @@ def _pptx_text(raw):
                     out.append(n.strip())
         except Exception:
             pass
+
+    text = "\n".join(out)
+    if text.strip():
+        return text
+
+    # Fallback: read the slide XML directly.
+    #
+    # python-pptx only exposes the shape kinds it models. SmartArt and some
+    # other graphic frames carry their text in parts of the XML it will not
+    # hand over, so a deck can be full of words and still extract to nothing
+    # through the shapes API. Every text run in an Office file — whatever
+    # drew it — is an <a:t> element, so scraping those finds anything the
+    # typed API missed. It loses the structure, which is why it is a
+    # fallback and not the first attempt.
+    return _pptx_raw_xml_text(raw)
+
+
+def _pptx_raw_xml_text(raw):
+    """Every <a:t> run in every slide and notes part, in slide order."""
+    out = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            parts = sorted(
+                n for n in z.namelist()
+                if re.match(r"ppt/(slides|notesSlides)/[^/]+\.xml$", n)
+            )
+            for p in parts:
+                try:
+                    xml = z.read(p).decode("utf-8", errors="ignore")
+                except Exception:
+                    continue
+                runs = re.findall(r"<a:t>(.*?)</a:t>", xml, re.S)
+                line = " ".join(html.unescape(r) for r in runs).strip()
+                if line:
+                    out.append(line)
+    except Exception as e:
+        print("raw pptx scrape failed:", e)
     return "\n".join(out)
+
+
+def _pptx_inventory(raw):
+    """(slide count, embedded image count) straight from the package.
+
+    Both numbers, not just images: a .pptx stores one copy of a repeated
+    image and references it from many slides, so image count alone
+    under-reports a deck that reuses a background or a logo. "40 slides,
+    3 images" and "40 slides, 40 images" describe very different files, and
+    the second is the one that means every slide is a picture."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            names = z.namelist()
+            slides = sum(1 for n in names
+                         if re.match(r"ppt/slides/slide\d+\.xml$", n))
+            images = sum(1 for n in names if n.startswith("ppt/media/"))
+            return slides, images
+    except Exception:
+        return 0, 0
 
 
 def _pdf_text(raw):
@@ -312,8 +371,11 @@ def _pdf_text(raw):
 def extract_text(uploaded):
     """Read an uploaded CV / JD / notes / slide deck.
 
-    Returns (text, error). `error` is a short human-readable reason the file
-    could not be opened at all, or None.
+    Returns (text, error, note).
+      error — a short human-readable reason the file could not be opened,
+              or None.
+      note  — when the file opened but yielded no text, what was actually
+              found instead (e.g. a deck of images). None otherwise.
 
     The two outcomes are deliberately distinct. "I could not open this" and
     "I opened it and there is no text in it" need different messages — a
@@ -325,7 +387,7 @@ def extract_text(uploaded):
     work as they did on the Space. Each accepts a file-like object, so the
     upload is never written to disk."""
     if uploaded is None:
-        return "", None
+        return "", None, None
 
     name = (getattr(uploaded, "name", "") or "").lower()
     try:
@@ -334,26 +396,44 @@ def extract_text(uploaded):
         try:
             raw = uploaded.read()
         except Exception as e:
-            return "", f"could not read the upload ({e})"
+            return "", f"could not read the upload ({e})", None
 
     if not raw:
-        return "", "the file is empty"
+        return "", "the file is empty", None
 
     try:
         if name.endswith(".pdf"):
-            return _pdf_text(raw), None
-        if name.endswith(".docx"):
+            text = _pdf_text(raw)
+        elif name.endswith(".docx"):
             import docx2txt
-            return (docx2txt.process(io.BytesIO(raw)) or ""), None
-        if name.endswith(".pptx"):
-            return _pptx_text(raw), None
-        return raw.decode("utf-8", errors="ignore"), None
+            text = docx2txt.process(io.BytesIO(raw)) or ""
+        elif name.endswith(".pptx"):
+            text = _pptx_text(raw)
+        else:
+            text = raw.decode("utf-8", errors="ignore")
     except Exception as e:
         # Surfaced to the user, not just printed. The first version swallowed
         # this and showed a flat "Could not read that file", which made a
         # real failure impossible to diagnose from the app.
         print("extract error:", type(e).__name__, e)
-        return "", f"{type(e).__name__}: {e}"
+        return "", f"{type(e).__name__}: {e}", None
+
+    if text.strip():
+        return text, None, None
+
+    # Opened cleanly, no text. Work out what IS in there so the message can
+    # say something true rather than offering the user a list of guesses.
+    note = None
+    if name.endswith(".pptx"):
+        slides, images = _pptx_inventory(raw)
+        if slides or images:
+            note = (f"the deck is {slides} slide{'s' if slides != 1 else ''} and "
+                    f"{images} image{'s' if images != 1 else ''} with no text at all — "
+                    "slides exported as pictures (NotebookLM, Canva and similar tools "
+                    "do this) have nothing to read")
+    elif name.endswith(".pdf"):
+        note = "the PDF has no text layer, which usually means it is a scan"
+    return "", None, note
 
 
 def _chunk(text, size=800):
@@ -484,7 +564,7 @@ if ctx_mode == "Paste text":
 else:
     up = st.sidebar.file_uploader("Upload document", type=["pdf", "docx", "pptx", "txt"])
     if up is not None:
-        text, err = extract_text(up)
+        text, err, note = extract_text(up)
         if err:
             st.sidebar.error(f"Could not read that file — {err}")
         elif text.strip():
@@ -493,11 +573,11 @@ else:
         else:
             # Opened fine, genuinely contains no extractable text. Saying
             # "could not read" here would send someone off re-exporting a
-            # file that was never the problem.
+            # file that was never the problem, so say what is actually in it.
             st.sidebar.warning(
-                "Opened that file, but found no text in it. If it is a scan or a "
-                "deck of image slides there is nothing to extract — paste the key "
-                "points instead."
+                (f"No text to extract — {note}." if note
+                 else "Opened that file, but found no text in it.")
+                + " Switch to **Paste text** and paste the key points instead."
             )
 
 CFG = {"mode": mode, "persona": persona, "target": target, "native": native,
