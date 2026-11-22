@@ -15,3 +15,8 @@ pypdf
 docx2txt
 python-pptx
 rank-bm25
+
+# Pillow arrives as a python-pptx dependency anyway, but the slide-reading
+# path imports it directly to downscale images before sending them to the
+# vision model. Listed explicitly so that dependency is not accidental.
+Pillow

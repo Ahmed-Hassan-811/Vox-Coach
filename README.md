@@ -94,6 +94,30 @@ open this"* from *"opened it, there is no text in it"* — a scanned PDF or an
 all-images deck is not a broken file, and saying so sends people off re-exporting
 something that was fine.
 
+**Picture decks can be read with a vision model.** Slides exported as images —
+NotebookLM, Canva, "export as images" — contain no text at all, so no extractor can
+help. When an uploaded `.pptx` opens cleanly but has no text and does have images, the
+sidebar offers a **Read the slides with AI** button, with the slide count and a rough
+time stated. It sends one downscaled slide image per call to a Groq vision model and
+asks for a transcription, not a description. It is never automatic, because it costs a
+call per slide.
+
+Details worth knowing before changing it:
+
+- The model is picked from a **fallback list** (`VISION_MODELS`), not hard-coded.
+  Groq's vision line-up moves — Maverick was shut down in March 2026 — and availability
+  differs per account, so a 404 on one model must not end the job. Whichever answers
+  first is remembered for the rest of the deck.
+- Free-tier vision is **30 requests/minute**, which an 18-slide deck can brush, so a
+  429 backs off and retries rather than losing the slide.
+- Images are **downscaled to 1600px** (image tokens scale with resolution) and then
+  encoded as **whichever of PNG or JPEG is smaller** — a slide that is mostly flat
+  colour and text is smaller as PNG, and always choosing JPEG made those slides bigger.
+  Groq caps base64 images at 4 MB; quality steps down before a slide is given up on.
+- **Partial results are kept.** If slide 12 fails, the other 17 are still returned and
+  the failures are named.
+- There is a **60-slide cap** so a large deck cannot quietly spend hundreds of calls.
+
 **The section radio has no `key=`.** With one, Streamlit refuses any later assignment to
 that state key in the same run (`StreamlitWidgetAlreadyInstantiatedError`), and
 "End & Save conversation" does exactly that when it jumps to Feedback — so the app would

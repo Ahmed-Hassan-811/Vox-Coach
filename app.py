@@ -41,6 +41,7 @@ WHAT CHANGED IN THE PORT — read this before editing
    last_audio_id check make a recording process exactly once.
 """
 
+import base64
 import hashlib
 import html
 import io
@@ -355,6 +356,189 @@ def _pptx_inventory(raw):
         return 0, 0
 
 
+# ---------------------------------------------------------------- reading picture slides
+#
+# Decks exported as one image per slide — NotebookLM, Canva, "export as
+# images" — contain no text at all, so no extractor can help. The only way
+# to read them is to look at them, which means a vision model.
+#
+# This costs one API call per slide and is therefore NEVER automatic. The
+# sidebar offers it as a button, with the slide count shown, after an upload
+# has already been found to be text-free.
+
+# Tried in order; the first that answers is remembered for the rest of the
+# deck. A single hard-coded model is the wrong shape here: Groq's vision
+# line-up moves (Maverick was shut down in March 2026) and availability
+# differs per account, so a 404 on one model must not end the job. The last
+# entry is a best guess and is expected to 404 on most accounts — harmless,
+# because the chain stops at whichever one works.
+VISION_MODELS = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "qwen/qwen3.6-27b",
+]
+
+VISION_PROMPT = (
+    "Transcribe every word of text visible on this slide, exactly as written. "
+    "Include the title, all bullet points, table cells, labels inside diagrams, "
+    "and axis labels on charts. Preserve the reading order. "
+    "Do not summarise, explain, describe the images, or add any commentary. "
+    "If the slide contains no readable text at all, reply with exactly: NO_TEXT"
+)
+
+# Groq accepts base64 images up to 4 MB. Slides are wide, and 1600px on the
+# long edge keeps body text legible while landing far under that — a 23 MB
+# deck of PNG screenshots becomes a few hundred KB per slide, which is the
+# difference between this taking half a minute and several minutes.
+VISION_MAX_PX = 1600
+VISION_MAX_B64 = 3_500_000          # headroom under Groq's 4 MB base64 cap
+VISION_SLIDE_CAP = 60               # refuse to spend hundreds of calls silently
+
+
+def _slide_images(raw):
+    """One image blob per slide, in slide order.
+
+    Takes the FIRST picture on each slide: in an exported deck that is the
+    slide itself. Reading every picture would re-send logos and decorations
+    as if they were content, at a call apiece."""
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    out = []
+
+    def first_picture(shapes, depth=0):
+        if depth > 10:
+            return None
+        for sh in shapes:
+            try:
+                if sh.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    found = first_picture(sh.shapes, depth + 1)
+                    if found:
+                        return found
+                    continue
+                if sh.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    return sh.image.blob
+            except Exception:
+                continue
+        return None
+
+    for slide in Presentation(io.BytesIO(raw)).slides:
+        out.append(first_picture(slide.shapes))
+    return out
+
+
+def _to_data_url(blob, max_px=VISION_MAX_PX, quality=82):
+    """Downscale a slide image and encode it small enough for the API.
+
+    Downscaling always happens: image tokens scale with resolution, so it
+    cuts the bill whatever the file size does.
+
+    The ENCODING is then chosen by measurement, not assumption. JPEG is the
+    obvious pick for a photographic slide, but a slide that is mostly flat
+    colour and text — which plenty are — is smaller as PNG, and an earlier
+    version of this function silently made those slides bigger. Both are
+    encoded and the smaller one is sent.
+
+    If neither fits the cap, JPEG quality is stepped down before giving up,
+    rather than sending a request certain to be rejected."""
+    from PIL import Image
+
+    im = Image.open(io.BytesIO(blob))
+    if im.mode not in ("RGB", "L"):
+        im = im.convert("RGB")
+    im.thumbnail((max_px, max_px))
+
+    def encoded(fmt, **kw):
+        buf = io.BytesIO()
+        im.save(buf, fmt, **kw)
+        return buf.getvalue()
+
+    png = encoded("PNG", optimize=True)
+    jpg = encoded("JPEG", quality=quality, optimize=True)
+
+    best, mime = (png, "image/png") if len(png) <= len(jpg) else (jpg, "image/jpeg")
+    candidates = [(best, mime)]
+    # Progressively cheaper fallbacks, only consulted if the best is too big.
+    for q in (60, 40):
+        candidates.append((encoded("JPEG", quality=q, optimize=True), "image/jpeg"))
+
+    for data, mt in candidates:
+        b64 = base64.b64encode(data).decode("ascii")
+        if len(b64) <= VISION_MAX_B64:
+            return f"data:{mt};base64,{b64}"
+    return None                     # genuinely too big; caller skips the slide
+
+
+def _vision_read(data_url, state):
+    """One slide through the vision model.
+
+    `state` carries the model that last worked and is mutated in place, so a
+    deck does not re-discover the working model — or re-pay for the 404s —
+    on every slide."""
+    client = get_client()
+    if client is None:
+        raise RuntimeError("GROQ_API_KEY is not set.")
+
+    order = ([state["model"]] if state.get("model")
+             else list(VISION_MODELS))
+    last_err = None
+
+    for model in order:
+        for attempt in range(3):
+            try:
+                r = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": [
+                        {"type": "text", "text": VISION_PROMPT},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ]}],
+                    temperature=0,          # transcription, not writing
+                    max_completion_tokens=1500,
+                )
+                state["model"] = model
+                return (r.choices[0].message.content or "").strip()
+            except Exception as e:
+                msg = str(e)
+                last_err = e
+                # Free tier is 30 requests/minute; an 18-slide deck can brush
+                # that. Back off and retry rather than losing the slide.
+                if "429" in msg or "rate" in msg.lower():
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                break                       # 404 / auth / bad request: next model
+    raise last_err if last_err else RuntimeError("No vision model available.")
+
+
+def read_slides_with_vision(raw, progress=None):
+    """Transcribe a picture deck. Returns (text, errors[]).
+
+    Partial results are kept: if slide 12 fails, the other 17 are still
+    worth having, and the caller is told which ones were lost."""
+    blobs = _slide_images(raw)
+    if len(blobs) > VISION_SLIDE_CAP:
+        return "", [f"deck has {len(blobs)} slides, over the {VISION_SLIDE_CAP}-slide limit"]
+
+    state, parts, errors = {"model": None}, [], []
+
+    for i, blob in enumerate(blobs, start=1):
+        if progress:
+            progress(i, len(blobs))
+        if not blob:
+            continue
+        try:
+            url = _to_data_url(blob)
+            if url is None:
+                errors.append(f"slide {i}: image too large to send")
+                continue
+            said = _vision_read(url, state)
+            if said and said.strip() and "NO_TEXT" not in said:
+                parts.append(f"[Slide {i}]\n{said.strip()}")
+        except Exception as e:
+            errors.append(f"slide {i}: {type(e).__name__}: {e}")
+
+    return "\n\n".join(parts), errors
+
+
 def _pdf_text(raw):
     """Per-page extraction. One malformed page in a long PDF should cost that
     page, not the document."""
@@ -501,6 +685,7 @@ DEFAULTS = {
     "last_fb": "",          # most recent feedback, for Translate
     "reply_audio": None,    # bytes of the coach's latest reply
     "last_audio_id": "",    # fingerprint of the last processed recording
+    "vision_text": "",      # slides transcribed by the vision model, if any
     "section": "Call",
     "notice": None,         # (kind, message) shown once after a rerun
 }
@@ -570,6 +755,11 @@ else:
         elif text.strip():
             st.session_state.doctxt = text
             st.sidebar.success(f"Loaded document ({len(text):,} characters).")
+        elif st.session_state.vision_text:
+            # Already transcribed this deck earlier in the session.
+            st.session_state.doctxt = st.session_state.vision_text
+            st.sidebar.success(
+                f"Read from the slides ({len(st.session_state.vision_text):,} characters).")
         else:
             # Opened fine, genuinely contains no extractable text. Saying
             # "could not read" here would send someone off re-exporting a
@@ -577,8 +767,39 @@ else:
             st.sidebar.warning(
                 (f"No text to extract — {note}." if note
                  else "Opened that file, but found no text in it.")
-                + " Switch to **Paste text** and paste the key points instead."
             )
+
+            # A picture deck can still be read — by looking at it. One API
+            # call per slide, so it is a button with the cost stated, never
+            # something that happens on upload.
+            raw_bytes = up.getvalue()
+            slides, images = _pptx_inventory(raw_bytes)
+            if up.name.lower().endswith(".pptx") and images:
+                st.sidebar.caption(
+                    f"These slides are pictures. VoxCoach can read them with a "
+                    f"vision model — about {slides} API call"
+                    f"{'s' if slides != 1 else ''}, roughly "
+                    f"{max(1, round(slides * 1.5 / 60))} min."
+                )
+                if st.sidebar.button("🔍 Read the slides with AI", type="primary"):
+                    bar = st.sidebar.progress(0.0, text="Reading slide 1…")
+
+                    def tick(i, total):
+                        bar.progress(i / max(total, 1), text=f"Reading slide {i} of {total}…")
+
+                    got, errs = read_slides_with_vision(raw_bytes, progress=tick)
+                    bar.empty()
+                    if got.strip():
+                        st.session_state.vision_text = got
+                        st.session_state.doctxt = got
+                        st.sidebar.success(f"Read {len(got):,} characters from the slides.")
+                    else:
+                        st.sidebar.error("Could not read any text from these slides.")
+                    for e in errs[:3]:
+                        st.sidebar.caption(f"⚠️ {e}")
+                    st.rerun()
+                else:
+                    st.sidebar.caption("Or switch to **Paste text** and paste the key points.")
 
 CFG = {"mode": mode, "persona": persona, "target": target, "native": native,
        "vocab": vocab, "ctx_mode": ctx_mode, "ctx_paste": ctx_paste}
